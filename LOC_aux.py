@@ -282,8 +282,11 @@ class MoleculeO:
     def Transitions(self, levels):
         """
         Update self.TRANSITION array so that it contains only transitions between levels < levels.
+        Assumes that levels are in increasing order of energy.
         """
         print("Transitions(%d) from TRANSITIONS=%d" % (levels, self.TRANSITIONS))
+        if (levels>=self.LEVELS): # nothing to do...
+            return self.TRANSITIONS
         # print(self.TRANSITION)
         ok  =  np.zeros(self.TRANSITIONS, np.int32)
         for i in range(self.TRANSITIONS):  # loop over original array
@@ -304,10 +307,10 @@ class MoleculeO:
             self.GG[t]    =  self.G[u]/self.G[l]
             # print("    %2d -> %2d   F= %12.4e   A= %12.4e" % (u, l, self.F[t], self.A[t]))
         # Drop also higher levels... that would otherwise be included in partition function
-        if (levels<len(self.G)):
+        if (levels<len(self.G)): # assumes levels in energy order
             self.G        =  asarray(self.G[0:levels], np.float32)*1.0
             self.E        =  asarray(self.E[0:levels], np.float32)*1.0
-        self.LEVELS = levels        
+        self.LEVELS  = levels        
         if (1): # dump the remaining data
             fp = open('%s.dump' % self.NAME, 'w')
             fp.write('%s\n' % self.NAME)
@@ -412,11 +415,16 @@ def ReadIni(filename):
     'nside'           : 64,                  # Healpix NSIDE for escape probability directions
     'cores'           : -1,                  # Number of cores to use (default -1 = all)
     'keys'            : [],                  # store all keywords
-    'fwhm'            : []                   # LOC_OT only, beam fwhm [arcsec] in the same order as "spectra" arguments
+    'fwhm'            : [],                  # LOC_OT only, beam fwhm [arcsec] in the same order as "spectra" arguments
+    'multitran'       : -1                   # >1 means multiple transitions calculated on single kernel call
     }
     lines = open(filename, 'r').readlines()
     for line in lines:        
         s = line.split()
+        for i in range(len(s)):
+            if (s[i][0:1]=="#"):
+                s = s[0:i]
+                break
         if (len(s)<1): continue
         if ((line[0:1]=='#')|(s[0]=='#')): continue
         INI['keys'].append(s[0])
@@ -446,7 +454,7 @@ def ReadIni(filename):
             INI['FITS'] = 1
             if (len(s)==1):                # one can also switch FITS off
                 INI['FITS'] = int(s[1])
-            if (len(s)>2):
+            if ((len(s)>2)&(s[1]!="#")):
                 INI['FITS_RA'] = float(s[1])
                 INI['FITS_DE'] = float(s[2])
             
@@ -561,7 +569,8 @@ def ReadIni(filename):
                 if (s[0].find("killemi")==0):      INI.update({'KILL_EMISSION': x})  # kill all emission from cells>x, 1D models only!!
                 if (s[0].find('minmaplevel')==0):  INI.update({'minmaplevel'  : x})
                 if (s[0].find("mapint")==0):       INI.update({'MAP_INTERPOLATION':   x})
-                if (s[0].find('losspec')==0):      INI.update({'losspectrum':  x}) #  1=escaped (observed) radiation, 2=emitted radiation without foreground absorption                
+                if (s[0].find('losspec')==0):      INI.update({'losspectrum':  x}) #  1=escaped (observed) radiation, 2=emitted radiation without foreground absorption
+                if (s[0].find('multitran')==0):    INI.update({'multitran':    x})
                 if (s[0].find("platform")==0):  
                     INI.update({'platforms':   [x,]})
                     if (len(s)>2): # user also specifies the device within the platform
@@ -1164,7 +1173,11 @@ def GetHealpixDirection(nside, ioff, idir, X, Y, Z, offs=1,  DOUBLE_POS=False, t
         tmp[imax] *= 1.00001
         tmp       /=  sqrt(sum(tmp**2.0))
         DIR['x'], DIR['y'], DIR['z'] =  tmp
-        LEADING    =  2*imax + [0,1][tmp[imax]<0.0]
+        # LEADING    =  2*imax + [0,1][tmp[imax]<0.0]
+        if (tmp[imax]<0.0):
+            LEADING    =  2*imax + 1
+        else:
+            LEADING    =  2*imax
     else:
         if (abs(DIR['x'])>abs(DIR['y'])):
             if (abs(DIR['x'])>abs(DIR['z'])):
@@ -1480,11 +1493,13 @@ def ReadOverlap(filename, mol, width, transitions, channels):
             freq          =  mol.F[OLBAND.GetTransition(iband, icmp)]
             # set OLBAND.COFF = shift in channels for each component, negative = shift left
             OLBAND.COFF[iband][icmp] = (f0-freq)*(2.9979245e5)/f0/width
-        # reset COFF so that first transition is in the centre of the full band
-        nchn   =  int((max(OLBAND.COFF[iband])-min(OLBAND.COFF[iband])) + channels)
-        delta  =  (nchn-1)/2.0 - 0.5*(min(OLBAND.COFF[iband])+max(OLBAND.COFF[iband])) - 0.5*channels
-        OLBAND.COFF[iband] += delta+0.5  # ???
-        OLBAND.NCHN[iband] =  nchn
+        ###
+        nchn   =  int((max(OLBAND.COFF[iband])-min(OLBAND.COFF[iband])) + channels)        
+        # reset COFF so that first transition is in the centre of the full band            
+        # move *first* component to the centre of the spectrum
+        delta  =  (nchn-1)/2.0 - 0.5*channels
+        OLBAND.COFF[iband] += delta  # ???
+        OLBAND.NCHN[iband]  =  nchn
     if (0):
         print("OLBAND: ", OLBAND)
         print("BANDS : ", OLBAND.BANDS)
@@ -1519,11 +1534,13 @@ def ConvolveSpectra1D(filename, fwhm_as, GPU=0, platforms=[0,1,2,3,4], angle_as=
     V0, DV       =  fromfile(fp, float32, 2)
     SPE          =  fromfile(fp, float32, NSPE*NCHN).reshape(NSPE, NCHN)
     INI          =  None
+    fwhm         =  -1.0
     if (angle_as<0.0): # angle not given as parameter, read pickled data from the spectrum file
         try:
             INI      =  pickle.load(fp)
             fp.close()
             fwhm     =  (fwhm_as/INI['angle']) * (NSPE-1.0)   # fwhm, in units where [0, NSPE-1] is the cloud radius
+            print("*** Pickled angle %.2f arcsec, fwhm_as %.2f, unitless %.3e" % (INI['angle'], fwhm_as, fwhm))
         except:
             print("*** ConvolveSpectra1D fails: angle_as not given as argument and not found in the spectrum file")
             sys.exit(0)
@@ -1531,6 +1548,7 @@ def ConvolveSpectra1D(filename, fwhm_as, GPU=0, platforms=[0,1,2,3,4], angle_as=
         #  fwhm = now in units of samples where cloud radius = [0, NSPE-1] points
         fwhm     =  (fwhm_as/angle_as) * (NSPE-1.0)  # fwhm [number of offset steps]
     ###
+    print("fwhm_as=%.2f, GPU=%d, angle_as=%.3f, samples=%d" % (fwhm_as, GPU, angle_as, samples))
     platform, device, context, queue, mf = InitCL(GPU, platforms)
     SPE_buf      =  cl.Buffer(context, mf.READ_ONLY,  4*NSPE*NCHN)
     CON_buf      =  cl.Buffer(context, mf.READ_WRITE, 4*NSPE*NCHN)

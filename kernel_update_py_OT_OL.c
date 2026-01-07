@@ -161,7 +161,9 @@ SpectraOL(  // both Cartesian and Octree
          itran   =  TRAN[icmp] ;
          tmp     =  NI[NCMP*CELLS + icmp*CELLS + INDEX] ;    // NBNB[NCMP,CELLS]
          tmp     =  (fabs(tmp)<1.0e-30f) ? (dx*1.0e-30f*GN[icmp]*GL) : clamp((float)(dx*tmp*GN[icmp]*GL), -2.0f, 1.0e10f) ;
+#if 0
          tmp     =  clamp(tmp, 1.0e-30f, 1.0e10f) ;  // $$$  KILL ALL MASERS
+#endif
          shift   =  round(doppler/WIDTH + COFF[icmp]) ;
          int i1  =  max(-shift,      LIM[row].x) ;
          int i2  =  min(NCHN-shift,  LIM[row].y) ;
@@ -347,7 +349,7 @@ __kernel void UpdateOL(const int           NCMP,       //   0 - number of spectr
          int i2   =  min(NCHN-shift,  LIM[row].y) ;
          for(int i=i1; i<i2; i++) {                    // over profile
             TAU[i+shift]  +=  tau  * profile[i] ;      // sum of all lines
-            EMIT[i+shift] +=  emit * profile[i] ;      // photons within one channel
+            EMIT[i+shift] +=  emit * profile[i] ;      // photons within one channel, all components
          }         
       }      
 
@@ -371,8 +373,8 @@ __kernel void UpdateOL(const int           NCMP,       //   0 - number of spectr
             sij[icmp]  +=  NTRUE[i+shift] * Ab[icmp]*GN*dx*profile[i]*TT[i+shift] ;
          }         
       }
-            
-      // emission-absorption
+
+      // emission-absorption, ignoring photons emitted and absorbed by the same component
       for(int icmp=0; icmp<NCMP; icmp++) {
          shift     =  round(doppler/WIDTH + COFF[icmp]) ;                  
          int i1    =  max(    -shift,  LIM[row].x) ;
@@ -380,12 +382,13 @@ __kernel void UpdateOL(const int           NCMP,       //   0 - number of spectr
          for(int i=i1; i<i2; i++) {
             tau        =  NI[NCMP*CELLS+icmp*CELLS+INDEX] * GN*dx    *profile[i] ;   // NBNB*GN*dx*profile
             emit       =  weight*NI[    icmp*CELLS+INDEX] * Aul[icmp]*profile[i] ;   // weight*nu*Aul*profile
-            // this sij==0 for a single component (test case...)
+            // this sij==0 for a single-component test case... since EMIT == emit
             sij[icmp] +=  (EMIT[i+shift]-emit) * Ab[icmp]*GN*profile[i] * ((1.0f-TT[i+shift]) / TAU[i+shift]) ;
+            // for single component esc == weight*NI*Aul*(1-exp(-tau*profile)/tau, with tau=nbnb*GN*dx
             esc[icmp] +=  emit * ( 1.0f   -   (1.0f-TT[i+shift]) * (tau/TAU[i+shift]) ) ;
          }
       } // for icmp
-
+      
       // update NTRUE
       for(int i=0; i<NCHN; i++) {
          NTRUE[i]  =  NTRUE[i] * exp(-TAU[i])   +    EMIT[i] * TT[i] ;
